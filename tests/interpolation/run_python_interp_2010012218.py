@@ -10,7 +10,7 @@ import os
 import numpy as np
 
 from enm.io.legacy_tradv import read_tradv, to_current_repo_format
-from enm.interpolation import apply_isentropic_interpolation, apply_isentropic_interpolation_mpot
+from enm.interpolation import apply_isentropic_interpolation
 
 date=2010012218
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     ds = read_tradv(HEAD_PATH, DATA_PATH, date=date)
     ds_int, ds_surf = to_current_repo_format(ds)
 
-    vars_dict = apply_isentropic_interpolation_mpot(ds_int, ds_surf, exp_type="ERA5")
+    vars_dict = apply_isentropic_interpolation(ds_int, ds_surf, exp_type="ERA5")
 
     for name, arr in vars_dict.items():
         print(f"{name}: shape={np.shape(arr)} dtype={np.asarray(arr).dtype}")

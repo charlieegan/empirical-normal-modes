@@ -1,237 +1,22 @@
-#isentropic_interpolation.py
 """
-Interpolate model-level fields onto target isentropic (theta) levels.
+Interpolate model-level fields onto target isentropic (theta) levels and derive isentropic
+density (r), vorticity (zeta) and Ertel PV (q).
 """
 import ctypes
 import numpy as np
 import xarray as xr
 from .. import _native
 
-##############################################################
-# Wrapper function that gets theta levels and obtains 
-# variables on these levels
-
-## Log of checks
-# 28/09/26
-# -  checked linear interpolation onto theta levels from model levels
-# - checked horizontal interpolation of winds
-# - checked computation of zeta (gives +/- values in norther/southern hemispheres)
-# - interpolation of pressure from model levels to theta
-# 02/10/26
-# - added nthlim/topminth (top of the theta range covered by the data); diagnostic only, not yet
-#   consumed by any downstream (wave-activity) code here
-# - density now differences p**kappa (proportional to the Montgomery-potential integrand) rather than
-#   p itself, since p**kappa is closer to linear in theta; still not the IDL's exact approach (integrate
-#   T to get M, then differentiate M twice -- see backwa_pvinv_nbs.pro ~2122-2178)
-# - removed _interpolate_stable's eps-patch-and-warn handling of non-monotonic columns, and the pure-
-#   NumPy fallback kernel entirely (enm._native is now required, no fallback). The native kernel
-#   (isentropic_interp.cpp) brackets each target theta by scanning from the surface up and taking the
-#   last level below it (a suffix-min + forward merge, O(n)) -- this is already exactly IDL's rule
-#   (first crossing scanning down from the top) for a column of ANY shape, monotonic or not, so no
-#   pre-processing of theta was needed. The removed NumPy fallback required a globally sorted array and
-#   could not do this, which is what the eps-patch/warning existed to work around.
-# 05/10/26
-# - q, zeta, r and the boundary fields are now full nlat in latitude, matching the IDL's array shapes:
-#   vorticity differencing injects an explicit U=V=0 boundary at the (fixed) north pole, mu=1, so the
-#   row adjacent to it can be computed via a one-sided difference -- same as IDL's uth/vth, which are
-#   padded with an always-zero row at each pole. The IDL's own vorticity loop only ever runs
-#   j=0..nlat-2 though (nlatend=nlat-1), so the southernmost row is never computed either side; here
-#   that row is left NaN (IDL leaves it at a stale zero-initialised value instead).
-#
-## Changes for consistency with the IDL (backwa_pvinv.pro, mode 1)
-# - Lower boundary = theta/pressure of model level nlev-nbound (IDL: lbound=1), taken from the
-#   UNMODIFIED model-level data. With nbound=1 the IDL never moves an unstable surface layer.
-# - Bottom-density mass fix applies to ALL columns, to levels mbot..mbot+mband, where mbot is the first
-#   theta level >= lower-boundary theta (varies by column). Mass is taken between plb (pressure of the
-#   lower-boundary model level, not surface pressure) and ptop.
-# - Polar lower-troposphere modification (vorticity cap + density redistribution up to first PV minimum)
-#   only where mbot+1 < mmed, and only for global data. Uses Lait PV when searching for the minimum.
-# NOT yet changed: density is from differencing p**kappa rather than IDL's integrate-T-then-
-# double-differentiate-M approach.
-
-
 def apply_isentropic_interpolation(ds_int,ds_surf,
-                                   exp_type=None,
-                                   a = 6371299.,Omega=7.292e-5,g=9.80665,kappa=2./7., # physical constants
-                                   nbound=1,mband=2,mumod=0.76,thref=380.,nlat_active=None):
-    '''
-    Interpolate model-level data onto isentropic levels and compute isentropic vorticity (zeta),
-    isentropic density (r) and modified (Lait) PV (q).
-
-    Parameters
-    ----------
-    ds_int : Dataset with theta, p, u, v on (time, model_level, latitude, longitude); level 0 = top.
-    ds_surf : kept for interface compatibility; not used (IDL uses the pressure of the lowest model
-              level, plb, rather than surface pressure, as the lower boundary of the column mass).
-    nbound : lower boundary is model level nlev-nbound (IDL nbound; 1 = lowest model level).
-    mband : the lowest density band spans theta levels mbot..mbot+mband (IDL mband).
-    mumod : sin(lat) below which the polar modification region is defined (IDL mumod; 0.76 for ERA data).
-    thref : reference theta for the Lait PV scaling.
-    nlat_active : apply the polar modification only to the first nlat_active latitude rows of the
-                  output (IDL only computes NH + 20 rows). None = all rows.
-
-    Output q, zeta, r and the boundary fields (thetalb, plb, ptop, mbot) are all full nlat in the
-    latitude dimension, matching the IDL's array shapes exactly: q/zeta have NaN in the southernmost
-    row, since the IDL's own vorticity loop never computes it either (see the note above dUdmu).
-    '''
-    # get theta levels onto which to interpolate model-level data
-    thlev = _get_theta_levels(exp_type=exp_type)
-    nth = len(thlev)
-    thlevh = _get_half_levels(thlev)
-    lait2pv = _get_lait2pv(thlev,thref=thref)
-    lats = ds_int.latitude.values
-    
-    # Lower boundary of the isentropic domain. Must use the unmodified model-level data.
-    theta_ml = ds_int['theta'].values
-    p_ml = ds_int['p'].values
-
-    # Top of the isentropic domain reliably covered by the data (IDL: topminth, nthlim).
-    nthlim, topminth = _get_top_theta_limit(theta_ml,thlevh)
-
-    thetalb, plb = _get_lower_boundary(theta_ml,p_ml,nbound=nbound)
-    mbot = _get_lowest_theta_index(thlev,thetalb)
-    medianths, mmed = _get_mmed(thetalb,lats,thlev,mumod=mumod)
-    
-    # Compute isentropic vorticity
-    ## linearly interpolate zonal wind and potential temperature onto latitude midpoints (slow, rewrite in C++ for speed)
-    ds_int['U'] = ds_int['u'] * np.cos(np.radians(ds_int.latitude)) / a
-    target_vars = ['U', 'theta']
-    # Midpoint between the last and first row (wrapping around a pole) is meaningless and must be
-    # dropped; this is a wraparound exclusion by position, not a check for an exact +/-90 gridpoint
-    # (a Gaussian grid, e.g. from legacy_tradv, never has one -- only a regular lat/lon grid does).
-    lat_indices = np.arange(len(lats) - 1)
-    U_th_lat_mids = ds_int[target_vars].map(
-        lambda var: .5*(var.roll(latitude=-1, roll_coords=False) + var).isel(latitude=lat_indices)
-    )
-
-    ## linearly interpolate meridional wind and potential temperature onto longitude midpoints (slow, rewrite in C++ for speed)
-    ds_int['V'] = ds_int['v'] * np.cos(np.radians(ds_int.latitude)) / a
-    target_vars = ['V', 'theta']
-    V_th_lon_mids = ds_int[target_vars].map(
-        lambda var: .5*(var.roll(longitude=-1, roll_coords=False) + var)
-    )
-
-    ## linearly interpolate U at latitude midpoints onto theta levels
-    U_interp = _interpolate_stable(U_th_lat_mids['theta'].values, {'U':U_th_lat_mids['U'].values}, thlev, fill_value=np.nan)
-
-    ## linearly interpolate V at longitude midpoints onto theta levels
-    V_interp = _interpolate_stable(V_th_lon_mids['theta'].values, {'V':V_th_lon_mids['V'].values}, thlev, fill_value=np.nan)
-
-    ## compute isentropic vorticity by differencing winds.
-    ## IDL stores u/v on a latitude half-grid with one extra row at each pole (muh(0)=1 at the north
-    ## pole, muh(nlat)=-1/0 at the south -- see backwa_pvinv_nbs.pro), which never gets assigned a
-    ## value, so those rows are implicitly U=V=0. That lets it difference across the row next to the
-    ## north pole using this zero boundary, but its main loop only ever runs j=0..nlat-2
-    ## (`for j=0,nlatend-1`, nlatend=nlat-1), so the southernmost row is simply never computed. This
-    ## asymmetry (pole boundary condition in the north, row just dropped in the south) is reproduced
-    ## here as-is for comparability -- it's a property of the legacy code, not of whether the real
-    ## data reaches the poles. mu=1 (not lats[0]) is the fixed boundary value, matching IDL's
-    ## convention regardless of where the first real data row actually is (e.g. ~89.46 deg on a
-    ## Gaussian grid, vs exactly 90 on a regular lat/lon grid).
-    # IDL builds muh as the average of mu=sin(lat) at neighbouring rows (muh(j)=0.5*(mu(j-1)+mu(j))),
-    # NOT the sine of the averaged latitude -- these differ (sin is nonlinear), negligibly away from
-    # the poles but significantly right next to one, which is exactly where the denominator below is
-    # also near zero, so using the wrong construction here gets catastrophically amplified at row 0.
-    mu_full = np.sin(np.deg2rad(lats))  # mu(j) = sin(lat(j)), all nlat rows
-    mu_mids = 0.5*(mu_full[:-1] + mu_full[1:])  # muh(j) for j=1..nlat-1: nlat-1 midpoints
-    mu_mids = np.concatenate([[1.], mu_mids])  # prepend muh(0)=1, the fixed north-pole boundary
-    U_pole = np.zeros_like(U_interp['U'][:,:,:1,:])  # explicit U=0 boundary, for every theta level
-    U_mids_padded = np.concatenate([U_pole, U_interp['U']], axis=2)  # (time,theta,nlat,lon)
-    dUdmu = np.diff(U_mids_padded,axis=2) / np.diff(mu_mids)[None,None,:,None]  # (time,theta,nlat-1,lon)
-
-    # IDL converts longitude to radians before differencing (longr=longitude*!dpi/180., then longh
-    # from that) -- ds_int.longitude is in degrees (legacy_tradv builds it as 0..360), so without this
-    # conversion dVdl comes out too small by a factor of 180/pi (~57.3), exactly the degrees-vs-radians
-    # ratio, since V itself (scaled by 1/a) needs the derivative taken with respect to an angle in
-    # radians to have consistent units with the rest of the vorticity formula.
-    lons = np.deg2rad(ds_int.longitude.values)
-    dVdl = np.diff(V_interp['V'], axis=-1, prepend=V_interp['V'][:,:,:,-1:]) / np.diff(lons, prepend=lons[-1:]-2*np.pi)
-    dVdl = dVdl[...,:-1,:] # match dUdmu's row range (0..nlat-2); the last row is never computed (see above)
-
-    mu = np.sin(np.deg2rad(lats))[:-1][None,None,:,None] # sin(lat) at the computed rows, 0..nlat-2
-    utermarr = - dUdmu
-    vtermarr= (1/(1-mu**2))*dVdl
-    zeta = 2*Omega*mu - dUdmu + (1/(1-mu**2))*dVdl # (time,theta,nlat-1,lon)
-    nan_row = np.full_like(zeta[:,:,:1,:], np.nan)
-    utermarr = np.concatenate([utermarr, nan_row], axis=2)
-    vtermarr = np.concatenate([vtermarr, nan_row], axis=2)
-    zeta = np.concatenate([zeta, nan_row], axis=2) # (time,theta,nlat,lon); last row never computed
-
-    # Compute isentropic density
-    ## interpolate pressure onto theta half-levels
-    p_interp = _interpolate_stable(theta_ml, {'p':p_ml}, thlevh, fill_value=np.nan)
-
-    ## Difference pressure to obtain isentropic density on theta levels
-    ## Here we use the identity
-    ##   r = -(1/g)*dp/dtheta = -(1/g)*d(p**kappa)/dtheta * p**(1-kappa) / kappa
-    ## which effectively means that we compute the density from the Montgomery potential
-    ## (p**kappa) rather than from pressure directly. This is more accurate in the stratosphere,
-    ## where p**kappa is nearly linear in theta, whereas p is highly nonlinear.
-    #r = -(1/g)*np.diff(np.permute_dims(p_interp['p'],(0,2,3,1)),axis=-1)/np.diff(thlevh)
-    p = np.permute_dims(p_interp['p'],(0,2,3,1))
-    pmids = 0.5*(p[...,:-1] + p[...,1:]) # midpoints of p**kappa for the density band
-    r = -(1/kappa/g)*pmids**(1-kappa)*np.diff(p**kappa,axis=-1)/np.diff(thlevh)
-    r = np.permute_dims(r,(0,3,1,2)) # (time,theta,nlat,lon); full nlat -- see note above zeta
-
-    ## pressure on the top boundary (theta = thtop). IDL falls back on the top model-level pressure
-    ## when thtop lies above the range of the data.
-    ptop = p_interp['p'][:,-1,:,:]
-    ptop = np.where(np.isfinite(ptop),ptop,p_ml[:,0])
-
-    # thetalb, plb, ptop, mbot are already full nlat (no latitude-differencing dependency, computed
-    # directly per-column), matching zeta and r's full-nlat shape -- no trimming needed.
-
-    # Distribute mass uniformly on the lowest band of theta levels, mbot..mbot+mband, so that the mass of
-    # each column between the lower boundary pressure and ptop is respected exactly (IDL: lbound=1).
-    all_cols = np.ones(mbot.shape,dtype=bool)
-    r = _set_bottom_density(r,mbot,mbot+mband,thlevh,thetalb,plb,ptop,all_cols,g=g)
-
-    # Levels below the lower boundary are not part of the domain
-    below = np.arange(nth)[None,:,None,None] < mbot[:,None]
-    r = np.where(below,np.nan,r).astype(r.dtype,copy=False)
-    zeta = np.where(below,np.nan,zeta)
-    zeta_unmod = zeta.copy()
-
-    # Cap relative vorticity and flatten density up to the first PV minimum in the polar lower
-    # troposphere, then compute modified (Lait) PV
-    zeta, r, q, modified = _modify_r_q(zeta,r,lait2pv,thlevh,thetalb,plb,ptop,mbot,mmed,
-                                       lats,Omega=Omega,g=g,mband=mband,nlat_active=nlat_active)
-
-    # Define output
-    vars_dict = {'U_lat_mids' : U_interp['U'], 'V_lon_mids' : V_interp['V'], 'p' : p_interp['p'], # interpolated variables
-                 'utermarr' : utermarr, 'vtermarr' : vtermarr, # contributions to vorticity
-                 'q' : q, 'zeta' : zeta, 'r' : r, 'zeta_unmod' : zeta_unmod, # derived variables
-                 'thetalb' : thetalb, 'plb' : plb, 'ptop' : ptop, 'mbot' : mbot, # boundary diagnostics
-                 'medianths' : medianths, 'mmed' : mmed, 'lait2pv' : lait2pv, 'thlev' : thlev, 'thlevh' : thlevh, # levels
-                 'polar_modified' : modified, 'nthlim' : nthlim, 'topminth' : topminth}
-
-    return vars_dict
-
-##############################################################
-# Variant that replicates the IDL's density derivation exactly (Montgomery potential), plus the
-# directly-interpolated Ertel PV. Everything else (theta levels, lower boundary, vorticity, the
-# bottom-density mass fix, the polar modification) reuses the same helpers as
-# apply_isentropic_interpolation above -- this function only differs in how `r` is derived, and in
-# adding Ertel PV as an extra output.
-
-def apply_isentropic_interpolation_mpot(ds_int,ds_surf,
                                         exp_type=None,
                                         a = 6371299.,Omega=7.292e-5,g=9.80665,kappa=2./7.,
                                         rdgas=287.,p00=1.e5,zs=0., # extra physical constants, only
                                                                    # needed for the Montgomery potential
                                         nbound=1,mband=2,mumod=0.76,thref=380.,nlat_active=None):
     '''
-    Like apply_isentropic_interpolation, but derives isentropic density (r) the way the IDL actually
-    does it (backwa_pvinv_nbs.pro lines ~2110-2166, see run_idl_interp_2010012218.pro): integrate
-    temperature over theta to get the Montgomery potential M = cp*T + geopotential, then differentiate
-    M twice (quadratic/3-point finite differences on the *full* theta levels) -- rather than
-    differencing interpolated pressure, as apply_isentropic_interpolation does. Also adds Ertel PV
-    directly interpolated onto theta levels (IDL: pvth, before its own Lait scaling), since the IDL
-    computes that independently of zeta/r/q, not derived from them.
-
-    This needs geopotential height, which nothing else in this module computes, so it's built here via
-    a per-column hydrostatic integration from the surface upward (IDL: zarr), exactly as the IDL does
-    it -- NOT via a more standard virtual-temperature/moist formulation, to match bit-for-bit.
+    Interpolate model-level data onto isentropic levels and compute isentropic vorticity (zeta),
+    isentropic density (r) and modified (Lait) PV (q). Translated directly from the IDL code
+    backwa_pvinv_nbs.pro using Claude Sonnet 5.
 
     Parameters
     ----------
@@ -307,10 +92,6 @@ def apply_isentropic_interpolation_mpot(ds_int,ds_surf,
     ## data reaches the poles. mu=1 (not lats[0]) is the fixed boundary value, matching IDL's
     ## convention regardless of where the first real data row actually is (e.g. ~89.46 deg on a
     ## Gaussian grid, vs exactly 90 on a regular lat/lon grid).
-    # IDL builds muh as the average of mu=sin(lat) at neighbouring rows (muh(j)=0.5*(mu(j-1)+mu(j))),
-    # NOT the sine of the averaged latitude -- these differ (sin is nonlinear), negligibly away from
-    # the poles but significantly right next to one, which is exactly where the denominator below is
-    # also near zero, so using the wrong construction here gets catastrophically amplified at row 0.
     mu_full = np.sin(np.deg2rad(lats))  # mu(j) = sin(lat(j)), all nlat rows
     mu_mids = 0.5*(mu_full[:-1] + mu_full[1:])  # muh(j) for j=1..nlat-1: nlat-1 midpoints
     mu_mids = np.concatenate([[1.], mu_mids])  # prepend muh(0)=1, the fixed north-pole boundary
@@ -318,11 +99,6 @@ def apply_isentropic_interpolation_mpot(ds_int,ds_surf,
     U_mids_padded = np.concatenate([U_pole, U_interp['U']], axis=2)  # (time,theta,nlat,lon)
     dUdmu = np.diff(U_mids_padded,axis=2) / np.diff(mu_mids)[None,None,:,None]  # (time,theta,nlat-1,lon)
 
-    # IDL converts longitude to radians before differencing (longr=longitude*!dpi/180., then longh
-    # from that) -- ds_int.longitude is in degrees (legacy_tradv builds it as 0..360), so without this
-    # conversion dVdl comes out too small by a factor of 180/pi (~57.3), exactly the degrees-vs-radians
-    # ratio, since V itself (scaled by 1/a) needs the derivative taken with respect to an angle in
-    # radians to have consistent units with the rest of the vorticity formula.
     lons = np.deg2rad(ds_int.longitude.values)
     dVdl = np.diff(V_interp['V'], axis=-1, prepend=V_interp['V'][:,:,:,-1:]) / np.diff(lons, prepend=lons[-1:]-2*np.pi)
     dVdl = dVdl[...,:-1,:] # match dUdmu's row range (0..nlat-2); the last row is never computed (see above)
